@@ -1,0 +1,39 @@
+[project]
+authors = [{name = "nutnond", email = "nutthanon18.work@gmail.com"}]
+dependencies = []
+name = "slide_stitcher"
+requires-python = ">= 3.11"
+version = "0.2.0"
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slide_stitcher"]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["osx-arm64"]
+
+[tool.pixi.pypi-dependencies]
+slide_stitcher = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+dev = "python -m slide_stitcher.main"
+build-mac = "pyinstaller packaging/slide_stitcher.spec --noconfirm"
+
+[tool.pixi.dependencies]
+python = "3.11.*"
+openslide-python = ">=1.4.6,<2"
+openslide = ">=4.0.1,<5"
+pyvips = ">=3.1.1,<4"
+libvips = ">=8.18.4,<9"
+pillow = ">=12.3.0,<13"
+numpy = ">=2.4.6,<3"
+scikit-learn = ">=1.9.0,<2"
+httpx = ">=0.28.1,<0.29"
+pydantic-settings = ">=2.14.2,<3"
+pytest = ">=9.1.1,<10"
+pyside6 = ">=6.11.1,<7"
+pyinstaller = ">=6.21.0,<7"

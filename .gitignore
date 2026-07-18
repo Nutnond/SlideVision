@@ -1,0 +1,142 @@
+# ============================================================
+# SlideVision — root .gitignore
+# ============================================================
+
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.eggs/
+build/
+develop-eggs/
+downloads/
+eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.manifest
+*.wheel
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ---------- Testing / linting ----------
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+
+# ---------- Virtual envs ----------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ---------- Pixi ----------
+# Keep pixi.lock for reproducible builds — do NOT ignore it.
+backend/.pixi/*
+!backend/.pixi/config.toml
+
+# ---------- PyInstaller ----------
+backend/build/
+backend/dist/
+*.spec.bak
+*.kdev4
+*.pyproject.bak
+
+# ---------- PySide6 / Qt ----------
+# Nothing to ignore here (PySide6 lives in .pixi/)
+
+# ---------- App runtime data ----------
+backend/storage/
+backend/.env
+backend/.env.local
+*.local
+.env
+.env.local
+.env.*.local
+
+# ---------- App logs ----------
+*.log
+logs/
+slidevision.log
+slidestitcher.log
+
+# ---------- OS-specific ----------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# ---------- IDE / editors ----------
+.vscode/
+!.vscode/settings.json.example
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.pydevproject
+.settings/
+*.swp
+*.swo
+*~
+.netrwhist
+*.suo
+*.user
+*.userprefs
+
+# ---------- Generated artifacts ----------
+# Keep generated icons in packaging/icons/ so builds work without regenerating
+# But ignore any *.dmg / *.exe / *.msi installers built locally
+*.dmg
+*.msi
+backend/dist/*.exe
+backend/dist/*.app/Contents/MacOS/SlideVision
+
+# ---------- OS cache / temp ----------
+*.tmp
+*.temp
+*.bak
+*.orig
+
+# ---------- Misc ----------
+.claude/
