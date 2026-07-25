@@ -8,11 +8,15 @@ from slide_stitcher.ui.widgets.snap_engine import SnapEngine
 
 DEFAULT_DISPLAY_MAX = 400.0
 
-# Discrete magnification stops (microscope objective metaphor).
-# Canvas zoom snaps to these — free zoom only allowed momentarily during a
-# pinch gesture, then snaps to the nearest stop on release.
+# Discrete canvas zoom presets (microscope objective metaphor). Shortcuts 1..6
+# jump to these. Free-form values (via status bar spinbox) are also allowed and
+# the nearest preset stays "highlighted" via _zoom_index.
 ZOOM_STOPS: list[float] = [1.0, 2.0, 4.0, 10.0, 20.0, 40.0]
 ZOOM_LABELS: list[str] = ["1×", "2×", "4×", "10×", "20×", "40×"]
+
+# Allow free-form zoom within this range.
+ZOOM_MIN: float = 0.1
+ZOOM_MAX: float = 200.0
 
 
 def _checker_brush() -> QBrush:
@@ -295,6 +299,29 @@ class SlideCanvas(QGraphicsView):
 
     def set_zoom_index(self, index: int) -> None:
         self._snap_zoom(index)
+
+    def set_zoom_factor(self, factor: float) -> None:
+        """Set canvas zoom to an arbitrary value (not restricted to ZOOM_STOPS).
+        The nearest stop's label still appears in shortcuts/menus via
+        _zoom_index, but the actual scale matches the requested factor."""
+        factor = max(ZOOM_MIN, min(ZOOM_MAX, float(factor)))
+        if abs(factor - self._zoom) < 1e-6:
+            return
+        # Re-anchor on viewport center for free-form zoom (cursor anchor would
+        # require cursor position; the spinbox is a deliberate value choice).
+        anchor = self.mapToScene(self.viewport().rect().center())
+        ratio = factor / self._zoom
+        self.scale(ratio, ratio)
+        self._zoom = factor
+        nearest = self._nearest_stop_index(factor)
+        if nearest != self._zoom_index:
+            self._zoom_index = nearest
+        self._emit_zoom_changed()
+        self.viewportChanged.emit()
+        new_center = self.mapFromScene(anchor)
+        delta = new_center - self.viewport().rect().center()
+        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() + delta.x())
+        self.verticalScrollBar().setValue(self.verticalScrollBar().value() + delta.y())
 
     def reset_zoom(self) -> None:
         self._snap_zoom(0)

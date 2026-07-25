@@ -1,9 +1,10 @@
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QRectF, QThread, Signal
+from PySide6.QtCore import QObject, QPoint, Qt, QRectF, QThread, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
     QFileDialog,
     QHBoxLayout,
     QInputDialog,
@@ -27,6 +28,7 @@ from slide_stitcher.ui.dialogs.crop_dialog import CropDialog
 from slide_stitcher.ui.dialogs.new_case_dialog import NewCaseDialog
 from slide_stitcher.ui.tile_loader import TileLoader
 from slide_stitcher.ui.widgets.case_sidebar import CaseSidebar
+from slide_stitcher.ui.widgets.minimap import MiniMap
 from slide_stitcher.ui.widgets.slide_canvas import SlideCanvas, ZOOM_LABELS, ZOOM_STOPS
 from slide_stitcher.ui.widgets.welcome_screen import WelcomeScreen
 
@@ -84,6 +86,12 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_shortcuts()
         self._build_statusbar()
+
+        # MiniMap overlay (bottom-right of canvas). Toggleable via View menu.
+        self._minimap = MiniMap(self.canvas, self)
+        self._minimap.setVisible(False)  # hidden until a case loads
+        self._minimap.raise_()
+        self._position_minimap()
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -160,6 +168,12 @@ class MainWindow(QMainWindow):
         view_menu.addAction("&Fit to View", self._on_fit_view, "Ctrl+0")
         view_menu.addAction("Zoom &In (next stop)", self._on_zoom_in, "Ctrl++")
         view_menu.addAction("Zoom &Out (prev stop)", self._on_zoom_out, "Ctrl+-")
+        view_menu.addSeparator()
+        self.minimap_action = view_menu.addAction("Show &MiniMap")
+        self.minimap_action.setCheckable(True)
+        self.minimap_action.setChecked(True)
+        self.minimap_action.setShortcut("Ctrl+M")
+        self.minimap_action.toggled.connect(self._on_toggle_minimap)
 
         zoom_menu: QMenu = view_menu.addMenu("&Canvas Zoom")
         zoom_menu.setToolTip(
@@ -195,13 +209,26 @@ class MainWindow(QMainWindow):
             sc.activated.connect(lambda checked=False, idx=i: self.canvas.set_zoom_index(idx))
 
     def _build_statusbar(self) -> None:
-        self.canvas_zoom_label = QLabel("Canvas: 1×")
-        self.canvas_zoom_label.setStyleSheet("padding: 0 12px; color: #94a3b8;")
+        # Editable zoom input — user can type any value (0.1× to 200×) or use
+        # the arrow buttons. Not restricted to discrete ZOOM_STOPS presets.
+        self.canvas_zoom_spin = QDoubleSpinBox()
+        self.canvas_zoom_spin.setRange(0.1, 200.0)
+        self.canvas_zoom_spin.setSingleStep(1.0)
+        self.canvas_zoom_spin.setDecimals(2)
+        self.canvas_zoom_spin.setSuffix("×")
+        self.canvas_zoom_spin.setValue(1.0)
+        self.canvas_zoom_spin.setFixedWidth(96)
+        self.canvas_zoom_spin.setToolTip(
+            "Canvas zoom factor. Type any value (0.1× to 200×) or use arrows. "
+            "Shortcuts 1..6 jump to preset stops."
+        )
+        self.canvas_zoom_spin.valueChanged.connect(self._on_spin_zoom_changed)
+
         self.effective_label = QLabel("")
         self.effective_label.setStyleSheet(
             "padding: 0 12px; color: #fbbf24; font-weight: 600;"
         )
-        self.statusBar().addPermanentWidget(self.canvas_zoom_label)
+        self.statusBar().addPermanentWidget(self.canvas_zoom_spin)
         self.statusBar().addPermanentWidget(self.effective_label)
         self.statusBar().showMessage("Ready")
 
@@ -226,8 +253,15 @@ class MainWindow(QMainWindow):
         n = len(case.slides)
         self.statusBar().showMessage(f"Case: {case.name} · {n} slide(s)")
         # Reset status bar magnification readouts.
-        self.canvas_zoom_label.setText(f"Canvas: {self.canvas.current_zoom_label()}")
+        self.canvas_zoom_spin.blockSignals(True)
+        self.canvas_zoom_spin.setValue(self.canvas.current_zoom_factor())
+        self.canvas_zoom_spin.blockSignals(False)
         self.effective_label.setText("")
+        # Show minimap if user has it enabled.
+        if self.minimap_action.isChecked():
+            self._minimap.setVisible(True)
+            self._position_minimap()
+            self._minimap.update_from_canvas()
 
     def _show_welcome(self) -> None:
         self.welcome.show()
@@ -244,6 +278,7 @@ class MainWindow(QMainWindow):
             return
         self.controller.close_case()
         self.setWindowTitle("SlideVision")
+        self._minimap.setVisible(False)
         self._show_welcome()
 
     def _on_delete_current_case(self) -> None:
@@ -539,9 +574,19 @@ class MainWindow(QMainWindow):
     # --- Phase 3: magnification + deep-zoom handlers ---
 
     def _on_zoom_changed(self, idx: int, label: str) -> None:
-        self.canvas_zoom_label.setText(f"Canvas: {label}")
+        # Update spinbox without triggering valueChanged loop.
+        new_value = self.canvas.current_zoom_factor()
+        if abs(new_value - self.canvas_zoom_spin.value()) > 1e-3:
+            self.canvas_zoom_spin.blockSignals(True)
+            self.canvas_zoom_spin.setValue(new_value)
+            self.canvas_zoom_spin.blockSignals(False)
         self._update_effective_label()
         self._schedule_tile_reload()
+        if self._minimap.isVisible():
+            self._minimap.update_from_canvas()
+
+    def _on_spin_zoom_changed(self, value: float) -> None:
+        self.canvas.set_zoom_factor(value)
 
     def _on_cursor_slide_changed(self, slide_id: object) -> None:
         self._update_effective_label(slide_id if isinstance(slide_id, str) else None)
@@ -549,6 +594,31 @@ class MainWindow(QMainWindow):
 
     def _on_viewport_changed(self) -> None:
         self._schedule_tile_reload()
+        if self._minimap.isVisible():
+            self._minimap.update_from_canvas()
+
+    def _on_toggle_minimap(self, enabled: bool) -> None:
+        self._minimap.setVisible(enabled and self.controller.case is not None)
+        if enabled:
+            self._minimap.update_from_canvas()
+        self.statusBar().showMessage(
+            f"MiniMap {'shown' if enabled else 'hidden'}", 2000
+        )
+
+    def _position_minimap(self) -> None:
+        """Place MiniMap in the bottom-right corner of the canvas viewport."""
+        if not hasattr(self, "_minimap") or self._minimap is None:
+            return
+        canvas_vp_topright = self.canvas.mapTo(self, self.canvas.viewport().rect().topRight())
+        canvas_vp_bottomright = self.canvas.mapTo(self, self.canvas.viewport().rect().bottomRight())
+        x = canvas_vp_bottomright.x() - self._minimap.width() - 12
+        y = canvas_vp_bottomright.y() - self._minimap.height() - 12
+        self._minimap.move(QPoint(int(x), int(y)))
+        self._minimap.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_minimap()
 
     def _update_effective_label(self, slide_id: str | None = None) -> None:
         if slide_id is None:
