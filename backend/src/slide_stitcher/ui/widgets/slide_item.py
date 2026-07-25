@@ -40,6 +40,17 @@ class SlideItem(QGraphicsObject):
 
         self._active_handle: str | None = None
         self._drag_start: dict | None = None
+        self._user_dragging: bool = False  # body drag (not handle) — gates magnetic snap
+        self._snap_applied_this_drag: bool = False  # avoid feedback loop in itemChange
+
+        # Hi-res tile overlay state (deep zoom). When enabled, tiles paint on
+        # top of the low-res thumbnail pixmap to reveal native WSI detail.
+        # _tile_config: dict with keys (level, pixel_w, pixel_h, tile_size)
+        # _tiles: dict[(origin_x_native, origin_y_native)] -> QPixmap
+        self._tile_config: dict | None = None
+        self._tiles: dict[tuple[int, int], QPixmap] = {}
+        self._show_tiles: bool = False  # gated by zoom level + not dragging
+        self._tiles_enabled: bool = True  # master toggle (e.g. disabled during handle drag)
 
         self.setFlag(QGraphicsObject.ItemIsMovable, True)
         self.setFlag(QGraphicsObject.ItemIsSelectable, True)
@@ -79,6 +90,29 @@ class SlideItem(QGraphicsObject):
                 self.pixmap,
                 QRectF(0, 0, self.pixmap.width(), self.pixmap.height()),
             )
+
+        # Hi-res tile overlay — paints native-resolution tiles on top of the
+        # thumbnail when zoomed in past thumbnail density. Tile (ox, oy) is in
+        # native WSI pixels; we map to slide-local coords via pixel_w/pixel_h.
+        if self._show_tiles and self._tiles_enabled and self._tile_config and self._tiles:
+            cfg = self._tile_config
+            px_w = max(1, cfg["pixel_w"])
+            px_h = max(1, cfg["pixel_h"])
+            tile_native = cfg["tile_size"]
+            scale_x = self._w / px_w
+            scale_y = self._h / px_h
+            tw = tile_native * scale_x
+            th = tile_native * scale_y
+            for (ox, oy), tile_pixmap in self._tiles.items():
+                if tile_pixmap.isNull():
+                    continue
+                x = ox * scale_x
+                y = oy * scale_y
+                painter.drawPixmap(
+                    QRectF(x, y, tw, th),
+                    tile_pixmap,
+                    QRectF(0, 0, tile_pixmap.width(), tile_pixmap.height()),
+                )
 
         painter.setPen(QPen(QColor(0, 0, 0, 40), 1))
         painter.setBrush(Qt.NoBrush)
@@ -201,8 +235,13 @@ class SlideItem(QGraphicsObject):
                 "crop_w": self._crop_w,
                 "crop_h": self._crop_h,
             }
+            self.suspend_tiles_for_drag()
             event.accept()
             return
+        if event.button() == Qt.LeftButton:
+            # Body drag (not handle) — enable magnetic snap.
+            self._user_dragging = True
+            self._snap_applied_this_drag = False
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QGraphicsSceneMouseEvent) -> None:
@@ -228,9 +267,17 @@ class SlideItem(QGraphicsObject):
                 self.cropped.emit(self.slide_id)
             else:
                 self.resized.emit(self.slide_id, self.pos().x(), self.pos().y(), self._w, self._h)
+            self.restore_tiles_after_drag()
             self.update()
             event.accept()
             return
+        if self._user_dragging:
+            self._user_dragging = False
+            self._snap_applied_this_drag = False
+            # Clear snap guides on release.
+            for view in self.scene().views():
+                if hasattr(view, "clear_snap_guides"):
+                    view.clear_snap_guides()
         super().mouseReleaseEvent(event)
 
     def _scene_to_local_delta(self, scene_delta: QPointF) -> QPointF:
@@ -355,6 +402,26 @@ class SlideItem(QGraphicsObject):
 
     def itemChange(self, change, value):
         if change == QGraphicsObject.ItemPositionHasChanged:
+            # Magnetic snap: only during interactive body drag, not programmatic moves.
+            if self._user_dragging and not self._snap_applied_this_drag:
+                canvas = None
+                for view in self.scene().views():
+                    if hasattr(view, "compute_snap"):
+                        canvas = view
+                        break
+                if canvas is not None and canvas.is_magnetic_enabled():
+                    proposed = QPointF(value.x(), value.y())
+                    adjusted, guides = canvas.compute_snap(self, proposed)
+                    canvas.set_snap_guides(guides)
+                    if adjusted != proposed:
+                        # Apply the snap. Set flag to suppress re-entrant snap on
+                        # the position-change this triggers.
+                        self._snap_applied_this_drag = True
+                        self.setPos(adjusted)
+                        self._snap_applied_this_drag = False
+                        # After snapping, subsequent drags within threshold should
+                        # re-snap — keep flag reset.
+                        value = adjusted
             self.moved.emit(self.slide_id, value.x(), value.y())
         elif change == QGraphicsObject.ItemSelectedHasChanged:
             self.selected_changed.emit(self.slide_id, bool(value))
@@ -430,6 +497,9 @@ class SlideItem(QGraphicsObject):
         self.update()
         self.resized.emit(self.slide_id, new_x, new_y, new_w, new_h)
         self.cropped.emit(self.slide_id)
+        # Pixmap replaced → tile geometry invalid, clear overlay.
+        self.clear_tiles()
+        self.set_tile_overlay_enabled(False)
         return True
 
     def pop_last_applied_delta(self) -> tuple[float, float, float, float] | None:
@@ -449,6 +519,57 @@ class SlideItem(QGraphicsObject):
 
     def current_geometry(self) -> tuple[float, float, float, float]:
         return self.pos().x(), self.pos().y(), self._w, self._h
+
+    # --- tile overlay API (used by canvas + TileLoader) ---
+
+    def set_tile_config(self, config: dict | None) -> None:
+        """Set or clear the tile geometry config. Tiles are only cleared when
+        a meaningful field changes (level, pixel_w/h, tile_size, applied_offset)
+        — panning the canvas does NOT invalidate already-loaded tiles."""
+        old = self._tile_config
+        if config is None:
+            if old is not None:
+                self._tile_config = None
+                self._tiles.clear()
+                self.update()
+            return
+        if old is not None and all(old.get(k) == config.get(k) for k in (
+            "level", "pixel_w", "pixel_h", "tile_size",
+            "applied_offset_x", "applied_offset_y",
+        )):
+            # No meaningful change — keep loaded tiles.
+            return
+        self._tile_config = config
+        self._tiles.clear()
+        self.update()
+
+    def set_tile_overlay_enabled(self, enabled: bool) -> None:
+        """Master on/off for the hi-res overlay (gated by zoom density)."""
+        if self._show_tiles != enabled:
+            self._show_tiles = enabled
+            self.update()
+
+    def set_tile_pixmap(self, origin_x_native: int, origin_y_native: int, pixmap: QPixmap) -> None:
+        self._tiles[(origin_x_native, origin_y_native)] = pixmap
+        if self._show_tiles and self._tiles_enabled:
+            self.update()
+
+    def clear_tiles(self) -> None:
+        if self._tiles:
+            self._tiles.clear()
+            self.update()
+
+    def suspend_tiles_for_drag(self) -> None:
+        """Hide overlay during interactive handle drag (prevents flicker from
+        stale tiles while geometry changes)."""
+        if self._tiles_enabled:
+            self._tiles_enabled = False
+            self.update()
+
+    def restore_tiles_after_drag(self) -> None:
+        if not self._tiles_enabled:
+            self._tiles_enabled = True
+            self.update()
 
 
 def import_shift_held() -> bool:

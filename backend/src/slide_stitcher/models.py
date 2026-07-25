@@ -14,6 +14,14 @@ class SlideMetadata(BaseModel):
     thumb_width: int
     thumb_height: int
     has_wsi: bool = False
+    # WSI magnification metadata (None when unknown / not yet extracted).
+    # Used for microscope-style magnification display + deep-zoom level selection.
+    mpp_x: float | None = None
+    mpp_y: float | None = None
+    objective_power: float | None = None
+    level_count: int = 0
+    level_downsamples: list[float] = []
+    level_dimensions: list[tuple[int, int]] = []
     created_at: datetime = Field(default_factory=datetime.now)
 
 

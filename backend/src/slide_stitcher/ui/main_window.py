@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, Qt, QRectF, QThread, Signal
 from PySide6.QtGui import QGuiApplication, QKeySequence, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QInputDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressDialog,
     QSplitter,
@@ -17,11 +18,16 @@ from PySide6.QtWidgets import (
 
 from slide_stitcher.models import CaseMetadata, Mapping, SlideMetadata
 from slide_stitcher.services import compose
+from slide_stitcher.services.tile_reader import TileRequest, pick_level_for_downsample
+from slide_stitcher.services.wsi_cache import WSIHandleCache
+from slide_stitcher.services import arrange
 from slide_stitcher.ui.controllers.case_controller import CaseController
+from slide_stitcher.ui.dialogs.arrange_dialog import ArrangeDialog
 from slide_stitcher.ui.dialogs.crop_dialog import CropDialog
 from slide_stitcher.ui.dialogs.new_case_dialog import NewCaseDialog
+from slide_stitcher.ui.tile_loader import TileLoader
 from slide_stitcher.ui.widgets.case_sidebar import CaseSidebar
-from slide_stitcher.ui.widgets.slide_canvas import SlideCanvas
+from slide_stitcher.ui.widgets.slide_canvas import SlideCanvas, ZOOM_LABELS, ZOOM_STOPS
 from slide_stitcher.ui.widgets.welcome_screen import WelcomeScreen
 
 
@@ -67,6 +73,12 @@ class MainWindow(QMainWindow):
         self.controller = CaseController()
         self.controller.caseLoaded.connect(self._on_case_loaded)
         self.controller.dirtyChanged.connect(self._on_dirty_changed)
+
+        # Deep-zoom infrastructure (Phase 3). Owned by MainWindow; cache is
+        # closed on case-close and on app exit.
+        self._wsi_cache = WSIHandleCache()
+        self._tile_loader = TileLoader(self._wsi_cache, parent=self)
+        self._tile_loader.tileReady.connect(self._on_tile_ready, Qt.QueuedConnection)
 
         self._build_ui()
         self._build_menu()
@@ -136,12 +148,28 @@ class MainWindow(QMainWindow):
         edit_menu.addAction("&Reset pending crop (selected)", self._on_reset_crop, "Ctrl+Shift+K")
         edit_menu.addAction("Reset &Rotation (selected)", self._on_reset_rotation, "Ctrl+R")
         edit_menu.addAction("Delete slide entirely…", self._on_delete_slide_entirely, "Shift+Delete")
+        edit_menu.addSeparator()
+        edit_menu.addAction("&Auto-Arrange Slides…", self._on_auto_arrange, "Ctrl+Shift+A")
+        self.magnetic_action = edit_menu.addAction("&Magnetic Edges")
+        self.magnetic_action.setCheckable(True)
+        self.magnetic_action.setChecked(True)
+        self.magnetic_action.setShortcut("Ctrl+Shift+M")
+        self.magnetic_action.toggled.connect(self._on_toggle_magnetic)
 
         view_menu = menubar.addMenu("&View")
-        view_menu.addAction("Fit to view", self._on_fit_view, "Ctrl+0")
-        view_menu.addAction("Zoom &In", self._on_zoom_in, "Ctrl++")
-        view_menu.addAction("Zoom &Out", self._on_zoom_out, "Ctrl+-")
-        view_menu.addAction("&Reset Zoom (100%)", self._on_reset_zoom, "Ctrl+1")
+        view_menu.addAction("&Fit to View", self._on_fit_view, "Ctrl+0")
+        view_menu.addAction("Zoom &In (next stop)", self._on_zoom_in, "Ctrl++")
+        view_menu.addAction("Zoom &Out (prev stop)", self._on_zoom_out, "Ctrl+-")
+
+        zoom_menu: QMenu = view_menu.addMenu("&Canvas Zoom")
+        zoom_menu.setToolTip(
+            "Sets canvas zoom factor. Effective microscope power depends on each "
+            "slide's native resolution and is shown in the status bar."
+        )
+        for i, label in enumerate(ZOOM_LABELS):
+            action = zoom_menu.addAction(label, lambda checked=False, idx=i: self.canvas.set_zoom_index(idx))
+            action.setToolTip(f"Canvas zoom = {ZOOM_STOPS[i]:.0f}× (not microscope magnification)")
+            action.setShortcutContext(Qt.ApplicationShortcut)
 
         help_menu = menubar.addMenu("&Help")
         help_menu.addAction("&About SlideVision", self._on_about)
@@ -160,14 +188,34 @@ class MainWindow(QMainWindow):
         esc.setContext(Qt.ApplicationShortcut)
         esc.activated.connect(self._clear_selection)
 
+        # Magnification stops — number keys 1..N jump to that stop.
+        for i in range(len(ZOOM_STOPS)):
+            sc = QShortcut(QKeySequence(str(i + 1)), self)
+            sc.setContext(Qt.ApplicationShortcut)
+            sc.activated.connect(lambda checked=False, idx=i: self.canvas.set_zoom_index(idx))
+
     def _build_statusbar(self) -> None:
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setStyleSheet("padding: 0 12px; color: #94a3b8;")
-        self.statusBar().addPermanentWidget(self.zoom_label)
+        self.canvas_zoom_label = QLabel("Canvas: 1×")
+        self.canvas_zoom_label.setStyleSheet("padding: 0 12px; color: #94a3b8;")
+        self.effective_label = QLabel("")
+        self.effective_label.setStyleSheet(
+            "padding: 0 12px; color: #fbbf24; font-weight: 600;"
+        )
+        self.statusBar().addPermanentWidget(self.canvas_zoom_label)
+        self.statusBar().addPermanentWidget(self.effective_label)
         self.statusBar().showMessage("Ready")
+
+        # Wire canvas signals (defined after _build_ui; safe to do here too).
+        self.canvas.zoomChanged.connect(self._on_zoom_changed, Qt.QueuedConnection)
+        self.canvas.cursorSlideChanged.connect(self._on_cursor_slide_changed, Qt.QueuedConnection)
+        self.canvas.viewportChanged.connect(self._on_viewport_changed, Qt.QueuedConnection)
 
     def _on_case_loaded(self, case: CaseMetadata) -> None:
         self.setWindowTitle(f"SlideVision — {case.name}")
+        # Drop cached handles + tiles from any previously open case.
+        self._wsi_cache.close_all()
+        from PySide6.QtGui import QPixmapCache
+        QPixmapCache.clear()
         self.canvas.clear_slides()
         for slide in case.slides:
             self._load_slide_to_canvas(slide)
@@ -177,6 +225,9 @@ class MainWindow(QMainWindow):
         self._show_workspace()
         n = len(case.slides)
         self.statusBar().showMessage(f"Case: {case.name} · {n} slide(s)")
+        # Reset status bar magnification readouts.
+        self.canvas_zoom_label.setText(f"Canvas: {self.canvas.current_zoom_label()}")
+        self.effective_label.setText("")
 
     def _show_welcome(self) -> None:
         self.welcome.show()
@@ -478,22 +529,228 @@ class MainWindow(QMainWindow):
 
     def _on_fit_view(self) -> None:
         self.canvas.fit_all()
-        self._update_zoom_label()
 
     def _on_zoom_in(self) -> None:
         self.canvas.zoom_in()
-        self._update_zoom_label()
 
     def _on_zoom_out(self) -> None:
         self.canvas.zoom_out()
-        self._update_zoom_label()
 
-    def _on_reset_zoom(self) -> None:
-        self.canvas.reset_zoom()
-        self._update_zoom_label()
+    # --- Phase 3: magnification + deep-zoom handlers ---
 
-    def _update_zoom_label(self) -> None:
-        self.zoom_label.setText(f"{self.canvas.zoom_percent()}%")
+    def _on_zoom_changed(self, idx: int, label: str) -> None:
+        self.canvas_zoom_label.setText(f"Canvas: {label}")
+        self._update_effective_label()
+        self._schedule_tile_reload()
+
+    def _on_cursor_slide_changed(self, slide_id: object) -> None:
+        self._update_effective_label(slide_id if isinstance(slide_id, str) else None)
+        self._schedule_tile_reload()
+
+    def _on_viewport_changed(self) -> None:
+        self._schedule_tile_reload()
+
+    def _update_effective_label(self, slide_id: str | None = None) -> None:
+        if slide_id is None:
+            slide_id = self.canvas._cursor_slide_id
+        if not slide_id or self.controller.case is None:
+            self.effective_label.setText("")
+            return
+        meta = next((s for s in self.controller.case.slides if s.id == slide_id), None)
+        if meta is None or not meta.has_wsi:
+            self.effective_label.setText("")
+            return
+        power = self._compute_effective_power(meta)
+        if power:
+            text = f"Mag: {power}  ({meta.original_filename})"
+        else:
+            text = meta.original_filename
+        self.effective_label.setText(text)
+
+    def _compute_effective_power(self, meta: SlideMetadata) -> str:
+        """Compute effective microscope power for the slide under cursor.
+        Formula: native_objective × (displayed screen pixels / native pixels in view).
+        Uses 1× ≈ 10µm/pixel convention when objective_power is missing."""
+        item = self.canvas._items_by_id.get(meta.id)
+        if item is None or meta.width == 0:
+            return ""
+        applied_w = item.get_applied_crop()[2]
+        native_px_w = max(1.0, applied_w * meta.width)
+        canvas_zoom = self.canvas.current_zoom_factor()
+        displayed_px = item._w * canvas_zoom
+        ratio = displayed_px / native_px_w  # >1 means upscaled past native detail
+        if meta.objective_power:
+            native = float(meta.objective_power)
+        elif meta.mpp_x:
+            native = 10.0 / float(meta.mpp_x)
+        else:
+            return "Unknown"
+        effective = native * ratio
+        if effective >= 10:
+            return f"{effective:.0f}×"
+        return f"{effective:.1f}×"
+
+    def _schedule_tile_reload(self) -> None:
+        """Recompute tile requests for all visible slides. Called on zoom,
+        pan, scroll, resize, and cursor-slide change."""
+        if self.controller.case is None:
+            return
+        canvas_zoom = self.canvas.current_zoom_factor()
+        viewport = self.canvas.viewport().rect()
+        visible_scene = self.canvas.mapToScene(viewport).boundingRect()
+        active_slide_ids: set[str] = set()
+
+        for slide_id, item in self.canvas._items_by_id.items():
+            meta = next((s for s in self.controller.case.slides if s.id == slide_id), None)
+            if meta is None or not meta.has_wsi or meta.width == 0 or meta.height == 0:
+                item.set_tile_overlay_enabled(False)
+                continue
+            # Fallback: if metadata hasn't been migrated yet, treat as single-level WSI.
+            downsamples = meta.level_downsamples or [1.0]
+
+            # Density check — enable tiles when zoomed past thumbnail resolution.
+            # Threshold 1.0 (was 1.5) so smaller-on-canvas slides still benefit.
+            ratio = (canvas_zoom * item._w) / max(1, item.pixmap.width())
+            if ratio < 1.0:
+                item.set_tile_overlay_enabled(False)
+                continue
+
+            item_scene_rect = item.sceneBoundingRect()
+            if not visible_scene.intersects(item_scene_rect):
+                # Off-screen: clear overlay to save memory, but don't cancel (might come back)
+                item.set_tile_overlay_enabled(False)
+                continue
+
+            active_slide_ids.add(slide_id)
+            self._request_tiles_for(meta, item, canvas_zoom, visible_scene, downsamples)
+
+        # Cancel pending requests for slides no longer active.
+        for sid in list(self._tile_loader_keys()):
+            if sid not in active_slide_ids:
+                self._tile_loader.cancel(sid)
+
+    def _request_tiles_for(self, meta: SlideMetadata, item, canvas_zoom: float, visible_scene, downsamples: list[float]) -> None:
+        applied_x, applied_y, applied_w, applied_h = item.get_applied_crop()
+        native_w = applied_w * meta.width
+        native_h = applied_h * meta.height
+        native_offset_x = applied_x * meta.width
+        native_offset_y = applied_y * meta.height
+
+        # Pick pyramid level: we want the level whose downsample gives ~1:1 with screen.
+        desired_ds = native_w / max(1.0, item._w * canvas_zoom)
+        level = pick_level_for_downsample(downsamples, desired_ds)
+        actual_ds = downsamples[level] if level < len(downsamples) else 1.0
+
+        tile_screen_size = 256  # at the chosen level
+        tile_native = max(1, int(tile_screen_size * actual_ds))
+
+        # Map viewport-visible scene rect into item-local coords (where 0,0 is the
+        # pixmap's top-left, NOT the bounding-rect top-left which includes the
+        # rotate-handle and corner-handle offsets). Handles rotation correctly
+        # because mapFromScene accounts for the full scene transform.
+        visible_local = item.mapFromScene(visible_scene).boundingRect().intersected(
+            QRectF(0, 0, item._w, item._h)
+        )
+        if visible_local.isEmpty():
+            item.set_tile_overlay_enabled(False)
+            return
+        # Map slide-local (0.._w) → native offset within the applied crop
+        sx = native_w / max(1.0, item._w)
+        sy = native_h / max(1.0, item._h)
+        vis_x0 = max(0.0, visible_local.left()) * sx
+        vis_y0 = max(0.0, visible_local.top()) * sy
+        vis_x1 = min(native_w, max(0.0, visible_local.right()) * sx)
+        vis_y1 = min(native_h, max(0.0, visible_local.bottom()) * sy)
+
+        col0 = max(0, int(vis_x0 // tile_native))
+        col1 = int(vis_x1 // tile_native)
+        row0 = max(0, int(vis_y0 // tile_native))
+        row1 = int(vis_y1 // tile_native)
+        # Cap to keep requests bounded. 256 tiles × ~256KB = 64MB per slide max —
+        # reasonable given 512MB QPixmapCache. With 4 worker pool, fills in ~2-4s.
+        max_tiles_per_slide = 256
+        if (col1 - col0 + 1) * (row1 - row0 + 1) > max_tiles_per_slide:
+            item.set_tile_overlay_enabled(False)
+            return
+
+        item.set_tile_config({
+            "level": level,
+            "pixel_w": int(native_w),
+            "pixel_h": int(native_h),
+            "tile_size": tile_native,
+            "applied_offset_x": int(native_offset_x),
+            "applied_offset_y": int(native_offset_y),
+        })
+        item.set_tile_overlay_enabled(True)
+
+        requests: list[TileRequest] = []
+        for c in range(col0, col1 + 1):
+            for r in range(row0, row1 + 1):
+                ox = int(native_offset_x + c * tile_native)
+                oy = int(native_offset_y + r * tile_native)
+                requests.append(TileRequest(
+                    slide_path=Path(meta.original_path),
+                    region_origin=(ox, oy),
+                    level=level,
+                    region_size=(tile_screen_size, tile_screen_size),
+                ))
+        if requests:
+            self._tile_loader.request(meta.id, requests)
+
+    def _on_tile_ready(self, slide_id, level, ox, oy, sw, sh, pixmap) -> None:
+        item = self.canvas._items_by_id.get(slide_id)
+        if item is None or not item._tile_config:
+            return
+        if item._tile_config.get("level") != level:
+            return  # tile belongs to an older request level
+        item_local_ox = ox - item._tile_config.get("applied_offset_x", 0)
+        item_local_oy = oy - item._tile_config.get("applied_offset_y", 0)
+        item.set_tile_pixmap(item_local_ox, item_local_oy, pixmap)
+
+    def _tile_loader_keys(self) -> set[str]:
+        # The TileLoader doesn't expose its active keys; we approximate by
+        # iterating all canvas slides. cancel() on a non-active id is a no-op.
+        return set(self.canvas._items_by_id.keys())
+
+    def _on_auto_arrange(self) -> None:
+        if self.controller.case is None:
+            QMessageBox.information(self, "Auto-Arrange", "No case loaded.")
+            return
+        positions = self.canvas.get_positions()
+        if len(positions) < 2:
+            QMessageBox.information(self, "Auto-Arrange", "Place at least 2 slides on the canvas first.")
+            return
+
+        dialog = ArrangeDialog(len(positions), self)
+        if dialog.exec() != ArrangeDialog.Accepted:
+            return
+        params = dialog.params()
+
+        if params["algorithm"] == ArrangeDialog.ALGO_GRID:
+            new_positions = arrange.arrange_grid(
+                positions,
+                columns=params["columns"],
+                gap=params["gap"],
+                preserve_order=params["preserve_order"],
+            )
+        else:
+            new_positions = arrange.arrange_row_pack(
+                positions,
+                target_row_height=params["target_row_height"],
+                gap=params["gap"],
+            )
+
+        self.canvas.apply_positions(new_positions)
+        self.controller.mark_dirty()
+        self.statusBar().showMessage(f"Auto-arranged {len(new_positions)} slides", 3000)
+
+    def _on_toggle_magnetic(self, enabled: bool) -> None:
+        # Wire to canvas in Phase 4.
+        if hasattr(self.canvas, "set_magnetic_enabled"):
+            self.canvas.set_magnetic_enabled(enabled)
+        self.statusBar().showMessage(
+            f"Magnetic edges {'on' if enabled else 'off'}", 2000
+        )
 
     def _on_about(self) -> None:
         QMessageBox.about(
@@ -501,11 +758,17 @@ class MainWindow(QMainWindow):
             "About SlideVision",
             "<h3>SlideVision</h3>"
             "<p>Reconstruct pathology case overview from multiple slides.</p>"
-            "<p>Version 0.2.0 · PySide6</p>"
+            "<p>Version 0.3.0-dev · PySide6</p>"
             "<p><b>Shortcuts:</b><br>"
             "⌘N New · ⌘O Open · ⌘S Save · ⌘E Export<br>"
-            "⌘0 Fit · ⌘+ Zoom in · ⌘- Zoom out · ⌘1 100%<br>"
-            "Delete Remove from canvas · Shift+⌫ Delete entirely</p>",
+            "⌘0 Fit · ⌘+ Zoom in · ⌘- Zoom out<br>"
+            "<b>1..6</b> Canvas zoom stops (1×/2×/4×/10×/20×/40×)<br>"
+            "Delete Remove from canvas · Shift+⌫ Delete entirely</p>"
+            "<p><b>Canvas zoom vs effective magnification:</b> The zoom buttons set a "
+            "uniform canvas zoom factor. The <b>actual microscope power</b> depends on "
+            "each slide's native scan resolution and is shown in the status bar "
+            "(<i>Mag: NN× — filename</i>).</p>"
+            "<p><i>Deep-zoom tiles load automatically when you zoom in past thumbnail resolution.</i></p>",
         )
 
     def _confirm_discard_dirty(self) -> bool:
@@ -530,4 +793,10 @@ class MainWindow(QMainWindow):
         if not self._confirm_discard_dirty():
             event.ignore()
             return
+        # Shutdown background tile loader + release OpenSlide handles.
+        try:
+            self._tile_loader.shutdown()
+            self._wsi_cache.close_all()
+        except Exception as e:
+            print(f"[shutdown] {e}")
         event.accept()

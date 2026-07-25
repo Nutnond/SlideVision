@@ -2,17 +2,51 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Qt, QThread, Signal
 
 from slide_stitcher.config import settings
 from slide_stitcher.models import CaseMetadata, Mapping, SlideMetadata, SlidePosition
 from slide_stitcher.services import compose, mapping, storage, wsi
 
 
+class MetadataExtractionWorker(QObject):
+    """Re-extracts WSI metadata (mpp, objective-power, level info) for slides in
+    a case that were registered before Phase 1 added these fields. Runs in a
+    background QThread so opening a legacy case is not blocked."""
+
+    progress = Signal(int, str)
+    finished = Signal(object)  # CaseMetadata with updated slides
+    failed = Signal(str)
+
+    def __init__(self, case: CaseMetadata) -> None:
+        super().__init__()
+        self._case = case
+
+    def run(self) -> None:
+        try:
+            slides = [s for s in self._case.slides if s.has_wsi and s.mpp_x is None]
+            total = len(slides)
+            for i, slide in enumerate(slides, 1):
+                meta = wsi.extract_wsi_metadata(Path(slide.original_path))
+                if meta is not None:
+                    slide.mpp_x = meta["mpp_x"]
+                    slide.mpp_y = meta["mpp_y"]
+                    slide.objective_power = meta["objective_power"]
+                    slide.level_count = meta["level_count"]
+                    slide.level_downsamples = meta["level_downsamples"]
+                    slide.level_dimensions = meta["level_dimensions"]
+                self.progress.emit(int(100 * i / max(1, total)), f"Extracting metadata {i}/{total}")
+            mapping.save_case(self._case)
+            self.finished.emit(self._case)
+        except Exception as e:
+            self.failed.emit(str(e))
+
+
 class CaseController(QObject):
     caseLoaded = Signal(object)
     caseClosed = Signal()
     slidesAdded = Signal(list)
+    slidesUpdated = Signal(object)  # CaseMetadata after lazy metadata migration
     slideRemoved = Signal(str)
     mappingSaved = Signal()
     dirtyChanged = Signal(bool)
@@ -22,6 +56,8 @@ class CaseController(QObject):
         self._case: CaseMetadata | None = None
         self._mapping: Mapping | None = None
         self._dirty: bool = False
+        self._meta_thread: QThread | None = None
+        self._meta_worker: MetadataExtractionWorker | None = None
 
     @property
     def case(self) -> CaseMetadata | None:
@@ -63,13 +99,53 @@ class CaseController(QObject):
         self._mapping = mapping.load_mapping(case_id)
         self.clear_dirty()
         self.caseLoaded.emit(case)
+        self._maybe_start_metadata_migration(case)
         return case
 
     def close_case(self) -> None:
+        self._stop_metadata_migration()
         self._case = None
         self._mapping = None
         self.clear_dirty()
         self.caseClosed.emit()
+
+    def _maybe_start_metadata_migration(self, case: CaseMetadata) -> None:
+        """Spawn background worker to extract WSI metadata for legacy slides that
+        were registered before mpp/level fields existed. No-op if all slides are
+        already migrated or none are WSI."""
+        needs = [s for s in case.slides if s.has_wsi and s.mpp_x is None]
+        if not needs:
+            return
+        self._stop_metadata_migration()
+        self._meta_thread = QThread()
+        self._meta_worker = MetadataExtractionWorker(case)
+        self._meta_worker.moveToThread(self._meta_thread)
+        self._meta_thread.started.connect(self._meta_worker.run)
+        self._meta_worker.finished.connect(self._on_metadata_finished, Qt.QueuedConnection)
+        self._meta_worker.failed.connect(self._on_metadata_failed, Qt.QueuedConnection)
+        self._meta_worker.finished.connect(self._meta_thread.quit)
+        self._meta_worker.failed.connect(self._meta_thread.quit)
+        self._meta_thread.finished.connect(self._meta_worker.deleteLater)
+        self._meta_thread.finished.connect(self._meta_thread.deleteLater)
+        self._meta_thread.start()
+
+    def _stop_metadata_migration(self) -> None:
+        if self._meta_thread is not None:
+            self._meta_thread.requestInterruption()
+            self._meta_thread.quit()
+            self._meta_thread.wait(3000)
+            self._meta_thread = None
+            self._meta_worker = None
+
+    def _on_metadata_finished(self, case: CaseMetadata) -> None:
+        self._meta_thread = None
+        self._meta_worker = None
+        self.slidesUpdated.emit(case)
+
+    def _on_metadata_failed(self, err: str) -> None:
+        print(f"[metadata migration] failed: {err}")
+        self._meta_thread = None
+        self._meta_worker = None
 
     def delete_case(self, case_id: str) -> None:
         """Permanently delete an entire case (metadata + slides + thumbnails)."""
@@ -112,6 +188,12 @@ class CaseController(QObject):
                 thumb_width=result.thumb_w,
                 thumb_height=result.thumb_h,
                 has_wsi=result.is_wsi,
+                mpp_x=result.mpp_x,
+                mpp_y=result.mpp_y,
+                objective_power=result.objective_power,
+                level_count=result.level_count,
+                level_downsamples=result.level_downsamples,
+                level_dimensions=result.level_dimensions,
             )
             self._case.slides.append(meta)
             new_slides.append(meta)
